@@ -1,15 +1,13 @@
 # CLAUDE.md — Agent Identity & Workflow (Template)
 
-> **FUNGSI:** File ini untuk **Claude / Claude Code / Claude Desktop**.
-> Isi SAMA dengan `SOUL.md` (template agent-identity), hanya fungsi beda: SOUL.md untuk agent non-Claude (Hermes/Codex/OpenClaw/OpenCode), CLAUDE.md untuk Claude.
-> Technical project context (MCP setup, indexer commands) ada di `AGENTS.md`.
+> **PURPOSE:** This file is for **Claude / Claude Code / Claude Desktop**.
+> SAME content as `SOUL.md` (agent-identity template), only the purpose differs: `SOUL.md` is for agents OUTSIDE Claude Code (Hermes/Codex/OpenClaw/OpenCode), `CLAUDE.md` is for Claude.
+> Technical project context (MCP setup, indexer commands) is in `AGENTS.md`.
 
-> Template untuk agent AI yang menggunakan Semantic Vault MCP.
-> Copy ke project root agent kamu (Claude Code: `CLAUDE.md`). Sesuaikan identity, tone, preferences.
+> Template for an AI agent using the Semantic Vault MCP.
+> Copy to your agent's project root (Claude Code: `CLAUDE.md`). Adjust identity, tone, and preferences to your needs.
 
 ---
-
-
 
 ## Identity
 
@@ -24,17 +22,17 @@
 1. **`search_vault()`** — semantic context retrieval
    - Query: `"vault structure agent memory error log decisions"`
    - Returns: top-10 relevant chunks
-   - Ini menggantikan read_file() untuk file besar
+   - Replaces read_file() for large files
 
-2. **`read_vault_file()`** — jika search result butuh konteks penuh
-   - Baca file spesifik dari hasil search_vault
+2. **`read_vault_file()`** — if search result needs full context
+   - Read specific file from search_vault result
 
-3. **`search_vault()`** — cek error patterns
+3. **`search_vault()`** — check error patterns
    - Query: `"error patterns known issues fixes"`
 
-4. **`skills_list()`** — scan semua skill yang available
+4. **`skills_list()`** — scan all available skills
 
-5. **`search_vault()`** — cek lessons learned
+5. **`search_vault()`** — check lessons learned
    - Query: `"lessons learned improvements corrections"`
 
 ### Verification Standard
@@ -70,17 +68,35 @@ Before reporting ANY task as done:
 - Read-only data pulls, log inspection
 - Anything reversible with a clear undo path
 
-## Vault-First Responses
+## Vault-First Query Flow (Stage 5 Classification)
 
-Ketika user nanya tentang APAPUN yang mungkin ada di vault:
+Before answering any user query, the agent MUST classify whether vault context is needed:
 
 ```
-User: "Apa yang kita punya tentang [topik]?"
-Agent: [panggil search_vault("[topik]") → dapat relevant chunks → jawab dari vault]
+User query / task
+      │
+      ▼
+Stage 5: "Does this need detail from the vault?"
+      │
+      ├── NO (SIMPLE: general knowledge, chit-chat) ──► Answer directly (1–3 tool calls, no vault)
+      │
+      └── YES (MEDIUM/COMPLEX: project, error, config, tools, DeFi, etc.)
+              │
+              ▼
+          search_vault(query, top_k=5)
+              │
+              ├── Relevant chunks found ──► Read context (read_vault_file if needed)
+              │                              + Holographic Memory + prior session
+              │                              ──► Execute ──► Answer
+              │
+              └── None / score < 0.5 ──► Answer from own knowledge
+                                            (state "not found in vault")
 ```
 
-**Jangan jawab dari training data** kalau topiknya spesifik tentang project/user setup.
-Selalu `search_vault()` dulu.
+**Rules:**
+- For queries about project status, past errors, design decisions, concepts, tools, or user preferences → ALWAYS `search_vault()` first (do not answer from training data).
+- Do NOT skip the "NO" branch — simple queries do not need vault lookup.
+- Web search is FALLBACK only when the vault is empty or the info is newer than what is stored.
 
 ## Output Rules
 
@@ -93,8 +109,8 @@ Selalu `search_vault()` dulu.
 
 ## Related Notes
 
-- [[CLAUDE.md]] — Agent project guidance
-- [[AGENTS.md]] — Hermes integration
+- [[SOUL.md]] — Agent identity template (non-Claude)
+- [[AGENTS.md]] — Hermes integration + technical MCP context
 - [[vault-structure/06-SYSTEM/rules/naming-convention]] — File naming
 - [[vault-structure/06-SYSTEM/rules/routing-table]] — Where to write what
 - [[vault-structure/06-SYSTEM/templates/template-moc]] — MOC creation

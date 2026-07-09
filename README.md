@@ -23,7 +23,7 @@ User query → Ollama embed → LanceDB vector search → relevant chunks → LL
 ## Features
 
 - 🔍 **Semantic search** — find notes by concept, not keyword
-- 🚀 **Batch embedding** — 30-50x faster than serial (50 chunks per HTTP call)
+- ⚡ **Batch embedding** — 30-50x faster than serial (50 chunks per HTTP call)
 - 👁️ **Auto file watcher** — re-index files as they change (via watchdog)
 - 🧩 **MCP server** — drop-in tool for Claude Desktop / Claude Code / Hermes
 - 💾 **Persistent hash store** — incremental indexing, only re-index what changed
@@ -90,26 +90,97 @@ Restart Claude Desktop. You now have `search_vault()`, `read_vault_file()`, `vau
 
 ## Architecture
 
+```mermaid
+graph TB
+    subgraph Vault["📁 Markdown Vault (VAULT_ROOT)"]
+        MD[".md files<br/>01-AGENT-MEMORY/ 02-KNOWLEDGE/<br/>03-RESEARCH/ ... (excl: .obsidian .trash .git)"]
+    end
+
+    subgraph Indexer["⚙️ vault_indexer.py"]
+        SCAN["Scan .md (rglob)"]
+        CHUNK["Chunk by ## headers<br/>(CHUNK_SIZE=512, OVERLAP=64)"]
+        HASH["MD5 hash store<br/>(incremental change detect)"]
+        EMBED["OllamaEmbedder.embed_batch()<br/>/api/embed — 50 chunks/call<br/>circuit breaker (5 fails → 60s pause)"]
+        LOCK["Instance lock (msvcrt)<br/>+ backup before index"]
+    end
+
+    subgraph Store["💾 LanceDB (LANCEDB_PATH)"]
+        LANCE["vault_chunks.lance table<br/>chunk_id | source | text | vector[1024] | indexed_at"]
+        HASHJSON["vault_indexer_hashes.json<br/>filepath → MD5"]
+    end
+
+    subgraph Ollama["🤖 Ollama (localhost:11434)"]
+        MODEL["EMBED_MODEL: bge-m3<br/>(1024-dim, multilingual)"]
+    end
+
+    subgraph MCP["🔌 mcp_server/server.py (stdio JSON-RPC)"]
+        TOOLS["Tools:<br/>search_vault · read_vault_file<br/>vault_stats · get_chunk<br/>reindex_file · index_stats"]
+        QEMBED["embed_query()<br/>/api/embeddings"]
+    end
+
+    subgraph Client["🤖 MCP Client (Agent)"]
+        AGENT["Claude / Hermes / Codex / OpenClaw<br/>SOUL.md (non-Claude) · CLAUDE.md (Claude)"]
+        SKILL["/scanthissession skill<br/>(scan → write vault)"]
+    end
+
+    Vault --> SCAN
+    SCAN --> CHUNK --> HASH
+    CHUNK --> EMBED --> Ollama
+    Ollama --> MODEL
+    EMBED --> LANCE
+    HASH --> HASHJSON
+    LOCK -.-> Store
+
+    Client -->|MCP tools/call| MCP
+    AGENT --> SKILL
+    TOOLS --> QEMBED --> Ollama
+    QEMBED --> LANCE
+    TOOLS -->|read_vault_file| Vault
+    MCP -->|search results (chunks)| Agent
 ```
-┌──────────────┐    ┌─────────────────────┐    ┌──────────────────────┐
-│              │    │  vault_indexer.py   │    │  semantic_search_    │
-│  Obsidian    │───▶│                     │───▶│  mcp.py (MCP server) │
-│  Vault (.md) │    │  - scan vault       │    │                      │
-│              │    │  - chunk by ##      │    │  Tools:              │
-└──────────────┘    │  - embed (Ollama)   │    │  - search_vault()    │
-                    │  - store (LanceDB)  │    │  - read_vault_file() │
-                    └──────────┬──────────┘    │  - vault_stats()     │
-                               │               │  - get_chunk()       │
-                               ▼               │  - reindex_file()    │
-                    ┌─────────────────────┐    │  - index_stats()     │
-                    │     LanceDB         │    └──────────────────────┘
-                    │  vault_chunks.lance │              │
-                    │  (vector store)     │              ▼
-                    └─────────────────────┘    ┌──────────────────────┐
-                                               │  Claude Desktop /    │
-                                               │  Hermes / Claude Code│
-                                               │  (MCP client)        │
-                                               └──────────────────────┘
+
+## Full Pipeline
+
+```mermaid
+flowchart TD
+    %% ===== STAGE 5 CLASSIFICATION (agent detects need first) =====
+    S1["User query / task"] --> S5{"Stage 5: Classification<br/>Need detail from vault?"}
+    S5 -->|NO — SIMPLE| S5a["Answer directly<br/>(1–3 tool calls, no vault)"]
+    S5 -->|YES — MEDIUM/COMPLEX| S5b["search_vault(query, top_k=5)"]
+
+    S5b --> S5c{"Relevant chunks<br/>found?"}
+    S5c -->|YES| S5d["Read context (read_vault_file if needed)<br/>+ Holographic Memory + prior session"]
+    S5c -->|NO / score < 0.5| S5e["Answer from own knowledge<br/>(state 'not found in vault')"]
+    S5d --> S6["Execution (tool calls, code, write)"]
+    S5e --> S6
+    S5a --> S6
+    S6 --> S7["Generate & deliver response"]
+    S7 --> S8["Post-task: auto-log vault + memory update<br/>(/scanthissession)"]
+
+    %% ===== QUERY MECHANISM =====
+    S5b -.->|MCP call| Q1["mcp_server/server.py<br/>tool_search_vault()"]
+    Q1 --> Q2["embed_query(query)<br/>POST /api/embeddings → Ollama bge-m3"]
+    Q2 --> Q3["LanceDB table.search(vector).limit(top_k)"]
+    Q3 --> Q4["return: source, text, score"]
+    Q4 -.-> S5c
+
+    %% ===== INDEX PIPELINE =====
+    subgraph IDX["🔄 INDEX PIPELINE (--once / --watch / --reindex)"]
+        I1["vault_indexer.py"] --> I2["Scan VAULT_ROOT *.md<br/>(excl .obsidian/.trash/.git)"]
+        I2 --> I3["MD5 vs hash store<br/>(skip if unchanged)"]
+        I3 -->|changed| I4["chunk_file() by ## headers"]
+        I4 --> I5["embed_batch(50/call)<br/>POST /api/embed → Ollama"]
+        I5 --> I6["table.add(rows)<br/>chunk_id|source|text|vector[1024]|indexed_at"]
+        I6 --> I7["update hash store"]
+    end
+    I5 -.-> OLLAMA[(Ollama bge-m3)]
+    I6 --> LANCE[(LanceDB vault_chunks.lance)]
+    Q3 --> LANCE
+    LANCE -.->|watchdog --watch| I3
+
+    %% ===== MAINTENANCE =====
+    M1["cron every 6h: --once (incremental)"] -.-> I1
+    M2["reindex_file(filepath) MCP tool"] -.-> I4
 ```
 
 ## Commands
@@ -152,18 +223,18 @@ Restart Claude Desktop. You now have `search_vault()`, `read_vault_file()`, `vau
 ```
 semantic-vault-mcp/
 ├── README.md               # Quick start + MCP config
-├── CLAUDE.md               # Agent identity template — FUNGSI: Claude / Claude Code
+├── CLAUDE.md              # Agent identity template — PURPOSE: Claude / Claude Code
 ├── AGENTS.md               # Technical MCP context + Hermes integration
-├── SOUL.md                 # Agent identity template — FUNGSI: agent non-Claude (Hermes/Codex/OpenClaw/OpenCode)
+├── SOUL.md                # Agent identity template — PURPOSE: agent non-Claude (Hermes/Codex/OpenClaw/OpenCode)
 ├── skills/                 # Agent skills
-│   └── scanthissession/    # /scanthissession — scan session → tulis ke vault
+│   └── scanthissession/    # /scanthissession — scan session → write to vault
 ├── LICENSE                 # MIT
-├── pyproject.toml          # pip install .
+├── pyproject.toml        # pip install .
 ├── requirements.txt
-├── .env.example            # All 12 env vars documented
+├── .env.example           # All 12 env vars documented
 ├── .gitignore
-├── setup.bat               # Windows one-click setup
-├── setup.sh                # Linux/Mac one-click setup
+├── setup.bat              # Windows one-click setup
+├── setup.sh               # Linux/Mac one-click setup
 ├── indexer/
 │   ├── __init__.py
 │   └── vault_indexer.py    # Scan → chunk → embed → store
@@ -193,6 +264,7 @@ semantic-vault-mcp/
 The RAG search is only as good as your index. If you add/edit 50 files but haven't re-indexed, the search will return **stale chunks** — or miss new content entirely.
 
 The indexer uses MD5 content hashes to detect changes, so re-indexing is fast:
+
 ```bash
 # Incremental — only processes changed files (usually <1 second)
 python indexer/vault_indexer.py --once
